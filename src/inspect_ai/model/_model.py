@@ -3318,6 +3318,8 @@ def record_and_check_model_usage(
     # record usage
     set_model_usage(model_name, usage, sample_model_usage_context_var.get(None))
     set_model_usage(model_name, usage, model_usage_context_var.get(None))
+    for tracked_usage in _tracked_usage_context_var.get():
+        set_model_usage(model_name, usage, tracked_usage)
 
     # record into the process-global throughput registry (cache hits never
     # reach this function — their early return in `_generate` keeps cached
@@ -3432,6 +3434,42 @@ def set_model_usage(
 
 def model_usage() -> dict[str, ModelUsage]:
     return model_usage_context_var.get()
+
+
+@contextlib.contextmanager
+def track_model_usage() -> Iterator[dict[str, ModelUsage]]:
+    """Track the usage of the models called within a block.
+
+    Use this to measure the cost of code that calls models internally (e.g. a
+    scorer or an agent) inside or outside of an eval:
+
+    ```python
+    with track_model_usage() as usage:
+        await scorer(state, target)
+    total_tokens = sum(u.total_tokens for u in usage.values())
+    ```
+
+    Calls made in tasks started within the block are included (a task that
+    outlives the block keeps adding to the yielded usage). Blocks can be
+    nested, and each records the calls made within it. Tracking does not
+    change how usage is recorded elsewhere (e.g. in eval and sample totals).
+    Cached responses are not counted, as they are not in eval totals.
+
+    Yields:
+       Usage by model name (as in `EvalStats.model_usage`), updated as
+       models are called.
+    """
+    usage: dict[str, ModelUsage] = {}
+    token = _tracked_usage_context_var.set((*_tracked_usage_context_var.get(), usage))
+    try:
+        yield usage
+    finally:
+        _tracked_usage_context_var.reset(token)
+
+
+_tracked_usage_context_var: ContextVar[tuple[dict[str, ModelUsage], ...]] = ContextVar(
+    "tracked_usage", default=()
+)
 
 
 model_usage_context_var: ContextVar[dict[str, ModelUsage]] = ContextVar(

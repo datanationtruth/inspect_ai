@@ -22,6 +22,7 @@ description: Model interface and providers.
 ### ModelConversation
 ### model_origin
 ### ModelUsage
+### track_model_usage
 ### StopReason
 ### ChatCompletionChoice
 ### OutputModality

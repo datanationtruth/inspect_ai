@@ -1,18 +1,29 @@
 """Tests for the OpenRouter provider's Anthropic prompt-caching support."""
 
 import json
-from typing import Any
+from typing import Any, cast
 
 import pytest
+from openai._models import construct_type
+from openai.types.responses import (
+    Response,
+    ResponseFunctionWebSearch,
+    ResponseReasoningItem,
+)
+from test_helpers.utils import skip_if_no_openrouter
 
+from inspect_ai._util.error import PrerequisiteError
 from inspect_ai.model._generate_config import GenerateConfig
 from inspect_ai.model._model_call import ModelCall
 from inspect_ai.model._model_output import ModelOutput, ModelUsage
+from inspect_ai.model._openai_responses import openai_responses_tools
 from inspect_ai.model._providers.openrouter import (
     OpenRouterAPI,
     _add_anthropic_cache_markers,
     _apply_cache_creation_usage,
 )
+from inspect_ai.tool import ToolFunction
+from inspect_ai.tool._tool_info import ToolInfo
 
 EPHEMERAL: dict[str, str] = {"type": "ephemeral"}
 
@@ -772,3 +783,413 @@ async def test_openrouter_responses_api_does_not_send_explicit_cache_fields(
         if isinstance(content, list):
             for block in content:
                 assert "prompt_cache_breakpoint" not in block
+
+
+# -- Web search (Responses API) -------------------------------------------------
+
+
+def _web_search_tool(options: dict[str, Any] | None = None) -> ToolInfo:
+    return ToolInfo(
+        name="web_search",
+        description="Search the web",
+        options={"openai": {}, "openrouter": options or {}},
+    )
+
+
+def _add_tool() -> ToolInfo:
+    return ToolInfo(name="add", description="Add two numbers")
+
+
+# an OpenRouter Responses API reply for a Claude model that searched once
+SIGNATURE = "EpsFCtoBCBMYAipA-signature"
+SEARCHED_RESPONSE: dict[str, Any] = {
+    "id": "gen-1",
+    "object": "response",
+    "created_at": 0,
+    "model": "anthropic/claude-sonnet-4.5",
+    "status": "completed",
+    "parallel_tool_calls": True,
+    "tool_choice": "auto",
+    "tools": [],
+    "output": [
+        {
+            "id": "rs_tmp_1",
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [],
+            "content": [{"type": "reasoning_text", "text": "I should search."}],
+            "signature": SIGNATURE,
+            "format": "anthropic-claude-v1",
+        },
+        {
+            "id": "st_tmp_1",
+            "type": "openrouter:web_search",
+            "status": "completed",
+            "action": {
+                "type": "search",
+                "query": "2024 F1 champion",
+                "sources": [{"type": "url", "url": "https://www.formula1.com/"}],
+            },
+        },
+        {
+            "id": "msg_tmp_1",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "Max Verstappen won.",
+                    "annotations": [
+                        {
+                            "type": "url_citation",
+                            "url": "https://www.formula1.com/",
+                            "title": "Formula 1",
+                            "start_index": 0,
+                            "end_index": 0,
+                        }
+                    ],
+                }
+            ],
+        },
+    ],
+    "usage": {
+        "input_tokens": 10,
+        "output_tokens": 5,
+        "total_tokens": 15,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens_details": {"reasoning_tokens": 3},
+    },
+}
+
+
+def _response(value: dict[str, Any]) -> Response:
+    # parse as the OpenAI SDK does, which accepts unknown output item types
+    return cast(Response, construct_type(type_=Response, value=value))
+
+
+def test_web_search_selects_responses_api() -> None:
+    assert _make_api("openai/gpt-5-mini").uses_responses_api(
+        [_web_search_tool()], GenerateConfig()
+    )
+    assert not _make_api("openai/gpt-5-mini").uses_responses_api(
+        [_add_tool()], GenerateConfig()
+    )
+    assert _make_api("openai/gpt-5-mini", responses_api=True).uses_responses_api(
+        [_add_tool()], GenerateConfig()
+    )
+
+
+def test_web_search_sent_as_server_tool() -> None:
+    api = _make_api("openai/gpt-5-mini")
+    tools, _, config = api.resolve_tools(
+        [_add_tool(), _web_search_tool({"engine": "native", "max_results": 3})],
+        "auto",
+        GenerateConfig(),
+    )
+    params = openai_responses_tools(tools, "openai/gpt-5-mini", config)
+    assert params[0]["type"] == "function"
+    assert params[1] == {
+        "type": "openrouter:web_search",
+        "parameters": {"engine": "native", "max_results": 3},
+    }
+
+
+def test_web_search_server_tool_without_options() -> None:
+    api = _make_api("openai/gpt-5-mini")
+    tools, _, config = api.resolve_tools([_web_search_tool()], "auto", GenerateConfig())
+    # native search unless an engine is set
+    assert openai_responses_tools(tools, "openai/gpt-5-mini", config) == [
+        {"type": "openrouter:web_search", "parameters": {"engine": "native"}}
+    ]
+
+
+def test_web_search_keeps_requested_engine() -> None:
+    api = _make_api("openai/gpt-5-mini")
+    tools, _, config = api.resolve_tools(
+        [_web_search_tool({"engine": "exa"})], "auto", GenerateConfig()
+    )
+    assert openai_responses_tools(tools, "openai/gpt-5-mini", config) == [
+        {"type": "openrouter:web_search", "parameters": {"engine": "exa"}}
+    ]
+
+
+def _search_call(server_tool_use_details: dict[str, Any] | None) -> ModelCall:
+    usage: dict[str, Any] = {"input_tokens": 1, "output_tokens": 1}
+    if server_tool_use_details is not None:
+        usage["server_tool_use_details"] = server_tool_use_details
+    return ModelCall.create(request={}, response={"output": [], "usage": usage})
+
+
+@pytest.mark.parametrize(
+    "options,details,warns",
+    [
+        # OpenRouter ran the search itself although native was requested
+        ({}, {"web_search_requests": 1, "tool_calls_executed": 1}, True),
+        ({"engine": "native"}, {"tool_calls_executed": 1}, True),
+        # the provider's native search
+        ({}, {"web_search_requests": 1}, False),
+        ({}, None, False),
+        # Exa was requested
+        ({"engine": "exa"}, {"tool_calls_executed": 1}, False),
+    ],
+)
+def test_warns_when_native_search_falls_back(
+    options: dict[str, Any],
+    details: dict[str, Any] | None,
+    warns: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import inspect_ai.model._providers.openrouter as openrouter_module
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        openrouter_module,
+        "warn_once",
+        lambda logger, message: warnings.append(message),
+    )
+    openrouter_module._warn_if_native_search_fell_back(
+        [_web_search_tool(options)], _search_call(details)
+    )
+    assert bool(warnings) == warns
+    if warns:
+        assert "Exa" in warnings[0]
+
+
+def test_web_search_without_openrouter_provider_is_unchanged() -> None:
+    api = _make_api("openai/gpt-5-mini")
+    tavily_only = ToolInfo(
+        name="web_search", description="Search the web", options={"tavily": {}}
+    )
+    tools, _, _ = api.resolve_tools([tavily_only], "auto", GenerateConfig())
+    assert tools == [tavily_only]
+
+
+def test_web_search_rejects_non_dict_options() -> None:
+    api = _make_api("openai/gpt-5-mini")
+    tool = ToolInfo(
+        name="web_search", description="Search", options={"openrouter": "yes"}
+    )
+    with pytest.raises(TypeError):
+        api.resolve_tools([tool], "auto", GenerateConfig())
+
+
+def test_web_search_forced_tool_choice_raises() -> None:
+    api = _make_api("openai/gpt-5-mini")
+    with pytest.raises(ValueError, match="cannot be forced"):
+        api.resolve_tools(
+            [_web_search_tool()], ToolFunction(name="web_search"), GenerateConfig()
+        )
+
+
+def test_web_search_requires_responses_api() -> None:
+    api = _make_api("openai/gpt-5-mini", responses_api=False)
+    with pytest.raises(PrerequisiteError, match="Responses API"):
+        api.resolve_tools([_web_search_tool()], "auto", GenerateConfig())
+
+
+def test_responses_extra_body_sends_routing_args() -> None:
+    api = _make_api(
+        "anthropic/claude-sonnet-4.5",
+        provider={"only": ["anthropic"]},
+        models=["anthropic/claude-haiku-4.5"],
+        transforms=["middle-out"],
+    )
+    assert api.responses_extra_body(GenerateConfig(extra_body={"user": "u1"})) == {
+        "user": "u1",
+        "provider": {"only": ["anthropic"]},
+        "models": ["anthropic/claude-haiku-4.5"],
+        "transforms": ["middle-out"],
+    }
+    assert _make_api("openai/gpt-5-mini").responses_extra_body(GenerateConfig()) is None
+    # model args take precedence over the same fields in extra_body
+    routed = _make_api("openai/gpt-5-mini", provider={"only": ["openai"]})
+    assert routed.responses_extra_body(
+        GenerateConfig(extra_body={"provider": {"only": ["azure"]}})
+    ) == {"provider": {"only": ["openai"]}}
+
+
+def test_responses_output_search_item_becomes_web_search_call() -> None:
+    api = _make_api("anthropic/claude-sonnet-4.5")
+    response = api.responses_process_response(_response(SEARCHED_RESPONSE))
+
+    search = response.output[1]
+    assert isinstance(search, ResponseFunctionWebSearch)
+    assert search.id == "st_tmp_1"
+    assert search.status == "completed"
+    assert search.action.type == "search"
+    assert search.action.query == "2024 F1 champion"
+    # other items are unchanged
+    assert isinstance(response.output[0], ResponseReasoningItem)
+
+
+def test_responses_output_unknown_search_action_is_kept_without_action(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    value = json.loads(json.dumps(SEARCHED_RESPONSE))
+    value["output"][1]["action"] = {"type": "browse", "page": 2}
+    value["output"][1]["status"] = "failed"
+    api = _make_api("anthropic/claude-sonnet-4.5")
+    response = api.responses_process_response(_response(value))
+
+    search = response.output[1]
+    assert isinstance(search, ResponseFunctionWebSearch)
+    assert search.action is None
+    assert search.status == "failed"
+    assert "not recognized" in caplog.text
+
+
+def test_responses_output_search_item_without_action() -> None:
+    value = json.loads(json.dumps(SEARCHED_RESPONSE))
+    del value["output"][1]["action"]
+    api = _make_api("anthropic/claude-sonnet-4.5")
+    search = api.responses_process_response(_response(value)).output[1]
+    assert isinstance(search, ResponseFunctionWebSearch)
+    assert search.action is None
+
+
+@pytest.mark.anyio
+async def test_web_search_generate_and_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from inspect_ai._util.citation import UrlCitation
+    from inspect_ai._util.content import ContentReasoning, ContentText, ContentToolUse
+    from inspect_ai.model._assistant_internal import init_sample_assistant_internal
+    from inspect_ai.model._chat_message import ChatMessageUser
+
+    init_sample_assistant_internal()
+    api = _make_api("anthropic/claude-sonnet-4.5", provider={"only": ["anthropic"]})
+    mock_create = AsyncMock(return_value=_response(SEARCHED_RESPONSE))
+    monkeypatch.setattr(api.client.responses, "create", mock_create)
+
+    tools = [_web_search_tool({"engine": "native"})]
+    user = ChatMessageUser(content="Who won the 2024 F1 championship?")
+    result = await api.generate([user], tools, "auto", GenerateConfig())
+    assert isinstance(result, tuple)
+    output = result[0]
+    assert isinstance(output, ModelOutput)
+
+    request = mock_create.call_args.kwargs
+    assert request["tools"] == [
+        {"type": "openrouter:web_search", "parameters": {"engine": "native"}}
+    ]
+    assert request["extra_body"]["provider"] == {"only": ["anthropic"]}
+
+    assert isinstance(output.message.content, list)
+    reasoning, search, text = output.message.content
+    assert isinstance(reasoning, ContentReasoning)
+    assert not reasoning.redacted
+    assert reasoning.reasoning == "I should search."
+    assert reasoning.summary is None
+    assert isinstance(search, ContentToolUse)
+    assert search.tool_type == "web_search"
+    assert json.loads(search.arguments)["query"] == "2024 F1 champion"
+    assert isinstance(text, ContentText)
+    assert text.citations is not None
+    assert [(c.url, c.title) for c in text.citations if isinstance(c, UrlCitation)] == [
+        ("https://www.formula1.com/", "Formula 1")
+    ]
+
+    # replayed from the log (no in-process replay state)
+    init_sample_assistant_internal()
+    follow_up = ChatMessageUser(content="Who came second?")
+    await api.generate(
+        [user, output.message, follow_up], tools, "auto", GenerateConfig()
+    )
+    items = mock_create.call_args.kwargs["input"]
+    replayed_reasoning = next(i for i in items if i.get("type") == "reasoning")
+    assert replayed_reasoning["encrypted_content"] == SIGNATURE
+    assert not replayed_reasoning["content"]
+    replayed_search = next(i for i in items if i.get("type") == "web_search_call")
+    assert replayed_search["id"] == "st_tmp_1"
+    assert replayed_search["action"]["query"] == "2024 F1 champion"
+
+
+@skip_if_no_openrouter
+@pytest.mark.parametrize(
+    "model", ["openrouter/anthropic/claude-sonnet-4.5", "openrouter/openai/gpt-5-mini"]
+)
+async def test_web_search_live_multi_turn(model: str) -> None:
+    """Search, cite, call a tool and continue from a replayed log."""
+    from pydantic import TypeAdapter
+
+    from inspect_ai._util.content import ContentReasoning, ContentText, ContentToolUse
+    from inspect_ai.model import (
+        ChatMessage,
+        ChatMessageTool,
+        ChatMessageUser,
+        get_model,
+    )
+    from inspect_ai.model._assistant_internal import init_sample_assistant_internal
+    from inspect_ai.tool import Tool, tool, web_search
+
+    @tool
+    def add() -> Tool:
+        async def execute(a: int, b: int) -> int:
+            """Add two integers.
+
+            Args:
+              a: First integer.
+              b: Second integer.
+            """
+            return a + b
+
+        return execute
+
+    model_args: dict[str, Any] = (
+        {"provider": {"only": ["anthropic"]}} if "anthropic" in model else {}
+    )
+    llm = get_model(
+        model,
+        config=GenerateConfig(reasoning_effort="low", reasoning_summary="auto"),
+        memoize=False,
+        **model_args,
+    )
+    tools = [web_search({"openrouter": {"engine": "native"}}), add()]
+
+    # a search with citations
+    output = await llm.generate(
+        "Search the web for the winner of the 2024 Formula 1 drivers' "
+        "championship and cite the page you used.",
+        tools=tools,
+    )
+    content = output.message.content
+    assert any(
+        isinstance(c, ContentToolUse) and c.tool_type == "web_search" for c in content
+    )
+    assert any(isinstance(c, ContentText) and c.citations for c in content)
+    assert any(isinstance(c, ContentReasoning) for c in content)
+
+    # an agent loop that searches and calls a tool, continued from a replayed log
+    messages: list[ChatMessage] = [
+        ChatMessageUser(
+            content="Search the web for the winner of the 2024 Formula 1 drivers' "
+            "championship, then use the add tool to add 17 and 25. Search first."
+        )
+    ]
+    adapter = TypeAdapter(list[ChatMessage])
+    for _ in range(4):
+        output = await llm.generate(messages, tools=tools)
+        messages.append(output.message)
+        if not output.message.tool_calls:
+            break
+        for call in output.message.tool_calls:
+            messages.append(
+                ChatMessageTool(
+                    content=str(call.arguments["a"] + call.arguments["b"]),
+                    tool_call_id=call.id,
+                    function=call.function,
+                )
+            )
+        messages = adapter.validate_json(adapter.dump_json(messages))
+        init_sample_assistant_internal()
+
+    assert any(
+        isinstance(c, ContentToolUse) and c.tool_type == "web_search"
+        for m in messages
+        if m.role == "assistant"
+        for c in m.content
+    )
+    assert "42" in messages[-1].text

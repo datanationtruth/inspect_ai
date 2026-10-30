@@ -6,7 +6,13 @@ from openai.types.chat import (
     ChatCompletion,
     ChatCompletionMessageParam,
 )
-from pydantic import JsonValue
+from openai.types.responses import (
+    Response,
+    ResponseFunctionWebSearch,
+    ResponseOutputItem,
+)
+from openai.types.responses.response_function_web_search import Action
+from pydantic import JsonValue, TypeAdapter, ValidationError
 from typing_extensions import NotRequired, TypedDict, override
 
 from inspect_ai._util.content import ContentReasoning
@@ -27,7 +33,11 @@ from inspect_ai.model._openai import (
     chat_choices_from_openai,
     openai_chat_message,
 )
-from inspect_ai.tool import ToolChoice
+from inspect_ai.model._openai_responses import (
+    REASONING_ENCRYPTED_CONTENT,
+    RESPONSES_VERBATIM,
+)
+from inspect_ai.tool import ToolChoice, ToolFunction
 from inspect_ai.tool._tool_info import ToolInfo
 
 from .._generate_config import GenerateConfig
@@ -152,6 +162,62 @@ class OpenRouterAPI(OpenAICompatibleAPI):
         # messages so the canonical request has a single leading system
         # message regardless of which provider OpenRouter selects.
         return True
+
+    @override
+    def uses_responses_api(self, tools: list[ToolInfo], config: GenerateConfig) -> bool:
+        # OpenRouter returns web searches (native or its own) only as Responses
+        # API output items, so requesting one selects that API unless
+        # responses_api is set
+        if self.responses_api is not None:
+            return self.responses_api
+        return any(_web_search_options(tool) is not None for tool in tools)
+
+    @override
+    def resolve_tools(
+        self, tools: list[ToolInfo], tool_choice: ToolChoice, config: GenerateConfig
+    ) -> tuple[list[ToolInfo], ToolChoice, GenerateConfig]:
+        if not any(_web_search_options(tool) is not None for tool in tools):
+            return super().resolve_tools(tools, tool_choice, config)
+        if self.responses_api is False:
+            raise PrerequisiteError(
+                "OpenRouter web search requires the Responses API: remove "
+                "responses_api=False or the 'openrouter' web_search() provider."
+            )
+        if isinstance(tool_choice, ToolFunction) and tool_choice.name == "web_search":
+            raise ValueError(
+                "OpenRouter's web search server tool cannot be forced with "
+                "tool_choice: the model decides when to search."
+            )
+        resolved = [
+            tool.model_copy(
+                update={
+                    "options": {
+                        **(tool.options or {}),
+                        RESPONSES_VERBATIM: _web_search_server_tool(options),
+                    }
+                }
+            )
+            if (options := _web_search_options(tool)) is not None
+            else tool
+            for tool in tools
+        ]
+        return super().resolve_tools(resolved, tool_choice, config)
+
+    @override
+    def responses_extra_body(self, config: GenerateConfig) -> dict[str, Any] | None:
+        extra_body = dict(config.extra_body or {})
+        if self.models:
+            extra_body["models"] = self.models
+        if self.provider:
+            extra_body["provider"] = self.provider
+        if self.transforms:
+            extra_body["transforms"] = self.transforms
+        return extra_body or None
+
+    @override
+    def responses_process_response(self, response: Response) -> Response:
+        response.output = [_responses_output_item(item) for item in response.output]
+        return response
 
     @override
     def should_retry(self, ex: BaseException) -> bool | RetryDecision:
@@ -308,6 +374,8 @@ class OpenRouterAPI(OpenAICompatibleAPI):
             output, call = result
             if isinstance(output, ModelOutput):
                 _apply_cache_creation_usage(output, call)
+                _stash_reasoning_signatures(output, call)
+                _warn_if_native_search_fell_back(tools, call)
         return result
 
     @override
@@ -420,6 +488,146 @@ class OpenRouterAPI(OpenAICompatibleAPI):
                 params[EXTRA_BODY]["reasoning"] = reasoning
 
         return params
+
+
+def _web_search_options(tool: ToolInfo) -> dict[str, Any] | None:
+    """OpenRouter options of a `web_search()` tool, or None if it doesn't enable OpenRouter."""
+    if (
+        tool.name != "web_search"
+        or not tool.options
+        or "openrouter" not in tool.options
+    ):
+        return None
+    options = tool.options["openrouter"]
+    if options is None:
+        return {}
+    if not isinstance(options, dict):
+        raise TypeError(
+            f"Expected a dictionary for openrouter options, got {type(options)}"
+        )
+    return options
+
+
+def _web_search_engine(options: dict[str, Any]) -> Any:
+    """The search engine requested: the model's native search unless set."""
+    return options.get("engine", "native")
+
+
+def _web_search_server_tool(options: dict[str, Any]) -> dict[str, Any]:
+    """OpenRouter `openrouter:web_search` server tool definition.
+
+    With the `native` engine OpenRouter maps the tool to the model provider's
+    built-in search; other engines (e.g. Exa) are run by OpenRouter.
+
+    https://openrouter.ai/docs/guides/features/server-tools/web-search
+    """
+    return {
+        "type": "openrouter:web_search",
+        "parameters": {**options, "engine": _web_search_engine(options)},
+    }
+
+
+def _warn_if_native_search_fell_back(tools: list[ToolInfo], call: ModelCall) -> None:
+    """Warn when native search was requested but OpenRouter ran the search itself.
+
+    OpenRouter falls back to its own engine (Exa) when the endpoint serving the
+    request has no native search. The response does not name the engine, but
+    a search OpenRouter runs itself is counted in `tool_calls_executed` of
+    `usage.server_tool_use_details`, which a provider's native search is not.
+    """
+    if not any(
+        (options := _web_search_options(tool)) is not None
+        and _web_search_engine(options) == "native"
+        for tool in tools
+    ):
+        return
+    response = call.response if isinstance(call.response, dict) else {}
+    usage = response.get("usage")
+    details = usage.get("server_tool_use_details") if isinstance(usage, dict) else None
+    executed = details.get("tool_calls_executed") if isinstance(details, dict) else None
+    if isinstance(executed, int) and executed > 0:
+        warn_once(
+            logger,
+            "OpenRouter ran a native web search with its own search engine (Exa) "
+            "because the endpoint serving the request has no native search. "
+            "Restrict routing to endpoints with native search using the "
+            "'provider' model arg (e.g. provider={'only': ['anthropic']}).",
+        )
+
+
+def _responses_output_item(item: ResponseOutputItem) -> ResponseOutputItem:
+    """Convert an `openrouter:web_search` item to a `web_search_call`.
+
+    OpenRouter returns OpenAI's native searches as `web_search_call` items, but
+    normalizes others (Anthropic's native search, or a search it runs with an
+    engine such as Exa) into its own `openrouter:web_search` item, keeping the
+    query and sources but not the result content. The SDK parses that item as
+    an output message. As a `web_search_call` it is recorded like OpenAI's
+    native search, and OpenRouter accepts it when it is replayed.
+    """
+    item_type: str = item.type
+    if item_type != "openrouter:web_search":
+        return item
+    extra = item.model_extra or {}
+    action: Action | None = None
+    if extra.get("action") is not None:
+        try:
+            action = _web_search_action.validate_python(extra["action"])
+        except ValidationError:
+            warn_once(
+                logger,
+                f"OpenRouter web search action not recognized, recording the search without it: {extra['action']}",
+            )
+    status = getattr(item, "status", None)
+    # the Responses conversion records a search without an action
+    return ResponseFunctionWebSearch.model_construct(
+        type="web_search_call",
+        id=getattr(item, "id", None) or "",
+        status=status if status in _WEB_SEARCH_STATUSES else "completed",
+        action=action,
+    )
+
+
+_web_search_action: TypeAdapter[Action] = TypeAdapter(Action)
+_WEB_SEARCH_STATUSES = ("in_progress", "searching", "completed", "failed")
+
+
+def _stash_reasoning_signatures(output: ModelOutput, call: ModelCall) -> None:
+    """Keep the signatures of reasoning items for replay.
+
+    OpenRouter returns a reasoning item's signature (e.g. Anthropic's thinking
+    signature) in a `signature` field rather than `encrypted_content`, so the
+    Responses conversion drops it. It is stashed on the `ContentReasoning`
+    (which keeps the item id as its `signature`) and replayed as the item's
+    `encrypted_content`, which OpenRouter forwards as the signature.
+    """
+    response = call.response if isinstance(call.response, dict) else {}
+    items = response.get("output")
+    signatures = {
+        item["id"]: item["signature"]
+        for item in (items if isinstance(items, list) else [])
+        if isinstance(item, dict)
+        and item.get("type") == "reasoning"
+        and not item.get("encrypted_content")
+        and isinstance(item.get("id"), str)
+        and isinstance(item.get("signature"), str)
+        and item["signature"]
+    }
+    if not signatures:
+        return
+    for choice in output.choices:
+        if isinstance(choice.message.content, str):
+            continue
+        for content in choice.message.content:
+            if (
+                isinstance(content, ContentReasoning)
+                and not content.redacted
+                and content.signature in signatures
+            ):
+                content.internal = {
+                    **(content.internal if isinstance(content.internal, dict) else {}),
+                    REASONING_ENCRYPTED_CONTENT: signatures[content.signature],
+                }
 
 
 def _requires_reasoning_content(model_name: str) -> bool:

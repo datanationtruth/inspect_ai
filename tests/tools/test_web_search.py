@@ -115,6 +115,14 @@ class TestNormalizeConfig:
         result = _normalize_config(None)
         assert result == ALL_INTERNAL_PROVIDERS
 
+    def test_normalize_config_openrouter_is_opt_in(self) -> None:
+        """OpenRouter search is billed per search, so it is never on by default."""
+        assert "openrouter" not in _normalize_config(None)
+        assert _normalize_config("openrouter") == {
+            **ALL_INTERNAL_PROVIDERS,
+            "openrouter": {},
+        }
+
     def test_normalize_config_disable_with_false(self) -> None:
         """Test using False to disable specific internal providers."""
         # Disable one internal provider

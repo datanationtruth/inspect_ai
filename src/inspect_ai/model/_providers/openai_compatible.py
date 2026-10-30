@@ -20,6 +20,7 @@ from openai.types.chat import (
     ChatCompletionMessageParam,
     ChatCompletionToolParam,
 )
+from openai.types.responses import Response
 from typing_extensions import override
 
 from inspect_ai._util.logger import warn_once
@@ -257,6 +258,8 @@ class OpenAICompatibleAPI(ModelAPI):
                 handle_bad_request=self.handle_bad_request,
                 handle_stream_error=self.handle_stream_error,
                 streaming=self.resolve_stream(config),
+                extra_body=self.responses_extra_body(config),
+                process_response=self.responses_process_response,
             )
 
         else:
@@ -456,6 +459,22 @@ class OpenAICompatibleAPI(ModelAPI):
             self.model_family(),
             supports_max_reasoning_effort=self.supports_max_reasoning_effort(),
         )
+
+    def responses_extra_body(self, config: GenerateConfig) -> dict[str, Any] | None:
+        """Fields to add to a Responses API request body as given.
+
+        For service-specific request fields (e.g. routing options) that the
+        Responses request builder does not set. See `generate_responses()`.
+        """
+        return None
+
+    def responses_process_response(self, response: Response) -> Response:
+        """Adapt a Responses API response before it is converted to model output.
+
+        For services that return output items or fields the OpenAI conversion
+        does not understand. See `generate_responses()`.
+        """
+        return response
 
     def supports_max_reasoning_effort(self) -> bool:
         """Whether the service accepts `reasoning_effort="max"` for this model.

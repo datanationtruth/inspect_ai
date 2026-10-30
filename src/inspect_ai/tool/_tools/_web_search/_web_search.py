@@ -24,6 +24,7 @@ WebSearchProvider: TypeAlias = Literal[
     "anthropic",
     "mistral",
     "perplexity",
+    "openrouter",
     "tavily",
     "google",
     "exa",
@@ -44,11 +45,11 @@ class WebSearchProviders(TypedDict, total=False):
 
     The `web_search()` tool provides models the ability to enhance their context window by performing a search. Web searches are executed using a provider. Providers are split into two categories:
 
-    -   Internal providers: `"openai"`, `"anthropic"`, `"gemini"`, `"grok"`, `mistral`, and `"perplexity"` - these use the model's built-in search capability and do not require separate API keys. These work only for their respective model provider (e.g. the "openai" search provider works only for `openai/*` models).
+    -   Internal providers: `"openai"`, `"anthropic"`, `"gemini"`, `"grok"`, `mistral`, `"perplexity"`, and `"openrouter"` - these use the model's built-in search capability and do not require separate API keys. These work only for their respective model provider (e.g. the "openai" search provider works only for `openai/*` models).
 
     -   External providers: `"tavily"`, `"exa"`, and `"google"`. These are external services that work with any model and require separate accounts and API keys. Note that "google" is different from "gemini" - "google" refers to Google's Programmable Search Engine service, while "gemini" refers to Google's built-in search capability for Gemini models.
 
-    By default, all internal providers are enabled if there are no external providers defined.
+    By default, all internal providers except "openrouter" are enabled if there are no external providers defined.
     If an external provider is defined then you need to explicitly enable internal providers
     that you want to use.
 
@@ -73,6 +74,9 @@ class WebSearchProviders(TypedDict, total=False):
     perplexity: dict[str, Any] | bool
     """Use Perplexity internal provider. For available options see <https://docs.perplexity.ai/docs/agent-api/tools/web-search>"""
 
+    openrouter: dict[str, Any] | bool
+    """Use OpenRouter internal provider. Not enabled by default; name it explicitly to use it. For available options see <https://openrouter.ai/docs/guides/features/server-tools/web-search>."""
+
     tavily: dict[str, Any] | bool
     """Use Tavili external provider. For available options see <Use Exa external provider. For available options see <https://inspect.aisi.org.uk/tools-standard.html#tavili-options>."""
 
@@ -90,6 +94,7 @@ class _NormalizedProviders(TypedDict, total=False):
     gemini: dict[str, Any]
     mistral: dict[str, Any]
     perplexity: dict[str, Any]
+    openrouter: dict[str, Any]
     tavily: dict[str, Any]
     google: dict[str, Any]
     exa: dict[str, Any]
@@ -116,7 +121,8 @@ def web_search(
     Web searches are executed using a provider. Providers are split
     into two categories:
 
-    - Internal providers: "openai", "anthropic", "grok", "gemini", "mistral", "perplexity".
+    - Internal providers: "openai", "anthropic", "grok", "gemini", "mistral", "perplexity",
+      "openrouter".
       These use the model's built-in search capability and do not require separate
       API keys. These work only for their respective model provider (e.g. the
       "openai" search provider works only for `openai/*` models).
@@ -124,7 +130,7 @@ def web_search(
     - External providers: "tavily", "google", and "exa". These are external services
       that work with any model and require separate accounts and API keys.
 
-    By default, all internal providers are enabled if there are no external providers defined.
+    By default, all internal providers except "openrouter" are enabled if there are no external providers defined.
     If an external provider is defined then you need to explicitly enable internal providers
     that you want to use.
 
@@ -138,7 +144,7 @@ def web_search(
     Args:
       providers: Configuration for the search providers to use. Currently supported
         providers are "openai", "anthropic", "perplexity", "tavily", "gemini", "mistral", "grok",
-        "google", and "exa". The `providers` parameter supports several formats
+        "openrouter", "google", and "exa". The `providers` parameter supports several formats
         based on either a `str` specifying a provider or a `dict` whose keys are
         the provider names and whose values are the provider-specific options. A
         single value or a list of these can be passed.
@@ -180,6 +186,9 @@ def web_search(
 
         - perplexity: Supports the fields of Perplexity's web_search tool.
           See https://docs.perplexity.ai/docs/agent-api/tools/web-search
+
+        - openrouter: Supports the parameters of OpenRouter's web search server tool.
+          See https://openrouter.ai/docs/guides/features/server-tools/web-search
 
         - tavily: Supports options like `max_results`, `search_depth`, etc.
           See https://docs.tavily.com/documentation/api-reference/endpoint/search

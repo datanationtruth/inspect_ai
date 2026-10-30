@@ -12,11 +12,11 @@ tbl-colwidths: [40,60]
 
 The `web_search()` tool provides models the ability to enhance their context window by performing a search. Web searches are executed using a provider. Providers are split into two categories:
 
--   Internal providers: `"openai"`, `"anthropic"`, `"gemini"`, `"grok"`, `"mistral"`, and `"perplexity"` - these use the model's built-in search capability and do not require separate API keys. These work only for their respective model provider (e.g. the "openai" search provider works only for `openai/*` models).
+-   Internal providers: `"openai"`, `"anthropic"`, `"gemini"`, `"grok"`, `"mistral"`, `"perplexity"`, and `"openrouter"` - these use the model's built-in search capability and do not require separate API keys. These work only for their respective model provider (e.g. the "openai" search provider works only for `openai/*` models).
 
 -   External providers: `"tavily"`, `"exa"`, and `"google"`. These are external services that work with any model and require separate accounts and API keys. Note that "google" is different from "gemini" - "google" refers to Google's Programmable Search Engine service, while "gemini" refers to Google's built-in search capability for Gemini models.
 
-By default, all internal providers are enabled if there are no external providers defined. If an external provider is defined then you need to explicitly enable internal providers that you want to use.
+By default, all internal providers except "openrouter" are enabled if there are no external providers defined. If an external provider is defined then you need to explicitly enable internal providers that you want to use.
 
 Internal providers will be prioritized if running on the corresponding model (e.g., "openai" provider will be used when running on `openai` models). If an internal provider is specified but the evaluation is run with a different model, a fallback external provider must also be specified.
 
@@ -111,6 +111,22 @@ For all the options, see Perplexity's [Web Search](https://docs.perplexity.ai/do
 The model decides whether to search. To make it search, set `tool_choice` to `"any"` or `ToolFunction("web_search")`.
 
 Note that when using the "perplexity" provider, you should also specify a fallback external provider (like "tavily", "exa", or "google") if you are also running the evaluation with non-Perplexity models.
+
+### OpenRouter Options
+
+The `web_search()` tool can use OpenRouter's [web search server tool](https://openrouter.ai/docs/guides/features/server-tools/web-search) when running on `openrouter/*` models. Unlike other internal providers, it is not enabled by default, so name it explicitly (e.g. `web_search("openrouter")`). It does not require any API keys beyond what's needed for the model itself. Search parameters (e.g. `engine`, `max_results`, `allowed_domains`, `user_location`) can be passed using the `openrouter` provider options and are forwarded to the server tool.
+
+OpenRouter returns web search results only through its Responses API, so requests that include an OpenRouter web search use that API (as with `-M responses_api=true`). Setting `responses_api=False` with an OpenRouter web search is an error.
+
+OpenRouter uses the model's native search where it supports one and otherwise falls back to Exa. To use the model provider's own search, set `engine` to `"native"`:
+
+``` python
+web_search({"openrouter": {"engine": "native"}})
+```
+
+Native search is offered per endpoint (e.g. Anthropic's API endpoint for Claude, but not Amazon Bedrock). To guarantee it, also restrict routing to endpoints that list `openrouter:web_search` in their `native_tools` (see `GET /api/v1/models/{author}/{slug}/endpoints`) using the `provider` model arg, for example `-M provider='{"only": ["anthropic"], "allow_fallbacks": false}'`.
+
+Each search is recorded in the transcript with its query and the pages it returned, and cited pages are recorded as citations. OpenRouter does not return the content of the search results, so when a conversation is replayed the model sees the queries and its own answers but not the pages it read. OpenRouter web search can't be forced with `tool_choice`.
 
 ### Tavily Options
 

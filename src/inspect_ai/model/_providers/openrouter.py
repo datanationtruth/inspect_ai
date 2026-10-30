@@ -165,8 +165,9 @@ class OpenRouterAPI(OpenAICompatibleAPI):
 
     @override
     def uses_responses_api(self, tools: list[ToolInfo], config: GenerateConfig) -> bool:
-        # OpenRouter's web search is only read from Responses API output, so
-        # requesting it selects that API unless responses_api is set
+        # OpenRouter returns web searches (native or its own) only as Responses
+        # API output items, so requesting one selects that API unless
+        # responses_api is set
         if self.responses_api is not None:
             return self.responses_api
         return any(_web_search_options(tool) is not None for tool in tools)
@@ -374,6 +375,7 @@ class OpenRouterAPI(OpenAICompatibleAPI):
             if isinstance(output, ModelOutput):
                 _apply_cache_creation_usage(output, call)
                 _stash_reasoning_signatures(output, call)
+                _warn_if_native_search_fell_back(tools, call)
         return result
 
     @override
@@ -506,23 +508,62 @@ def _web_search_options(tool: ToolInfo) -> dict[str, Any] | None:
     return options
 
 
+def _web_search_engine(options: dict[str, Any]) -> Any:
+    """The search engine requested: the model's native search unless set."""
+    return options.get("engine", "native")
+
+
 def _web_search_server_tool(options: dict[str, Any]) -> dict[str, Any]:
     """OpenRouter `openrouter:web_search` server tool definition.
 
+    With the `native` engine OpenRouter maps the tool to the model provider's
+    built-in search; other engines (e.g. Exa) are run by OpenRouter.
+
     https://openrouter.ai/docs/guides/features/server-tools/web-search
     """
-    tool: dict[str, Any] = {"type": "openrouter:web_search"}
-    if options:
-        tool["parameters"] = options
-    return tool
+    return {
+        "type": "openrouter:web_search",
+        "parameters": {**options, "engine": _web_search_engine(options)},
+    }
+
+
+def _warn_if_native_search_fell_back(tools: list[ToolInfo], call: ModelCall) -> None:
+    """Warn when native search was requested but OpenRouter ran the search itself.
+
+    OpenRouter falls back to its own engine (Exa) when the endpoint serving the
+    request has no native search. The response does not name the engine, but
+    a search OpenRouter runs itself is counted in `tool_calls_executed` of
+    `usage.server_tool_use_details`, which a provider's native search is not.
+    """
+    if not any(
+        (options := _web_search_options(tool)) is not None
+        and _web_search_engine(options) == "native"
+        for tool in tools
+    ):
+        return
+    response = call.response if isinstance(call.response, dict) else {}
+    usage = response.get("usage")
+    details = usage.get("server_tool_use_details") if isinstance(usage, dict) else None
+    executed = details.get("tool_calls_executed") if isinstance(details, dict) else None
+    if isinstance(executed, int) and executed > 0:
+        warn_once(
+            logger,
+            "OpenRouter ran a native web search with its own search engine (Exa) "
+            "because the endpoint serving the request has no native search. "
+            "Restrict routing to endpoints with native search using the "
+            "'provider' model arg (e.g. provider={'only': ['anthropic']}).",
+        )
 
 
 def _responses_output_item(item: ResponseOutputItem) -> ResponseOutputItem:
     """Convert an `openrouter:web_search` item to a `web_search_call`.
 
-    The SDK parses OpenRouter's search item as an output message. As a
-    `web_search_call` it is recorded like OpenAI's native search, and
-    OpenRouter accepts it when it is replayed.
+    OpenRouter returns OpenAI's native searches as `web_search_call` items, but
+    normalizes others (Anthropic's native search, or a search it runs with an
+    engine such as Exa) into its own `openrouter:web_search` item, keeping the
+    query and sources but not the result content. The SDK parses that item as
+    an output message. As a `web_search_call` it is recorded like OpenAI's
+    native search, and OpenRouter accepts it when it is replayed.
     """
     item_type: str = item.type
     if item_type != "openrouter:web_search":

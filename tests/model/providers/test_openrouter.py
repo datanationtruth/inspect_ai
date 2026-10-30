@@ -898,9 +898,62 @@ def test_web_search_sent_as_server_tool() -> None:
 def test_web_search_server_tool_without_options() -> None:
     api = _make_api("openai/gpt-5-mini")
     tools, _, config = api.resolve_tools([_web_search_tool()], "auto", GenerateConfig())
+    # native search unless an engine is set
     assert openai_responses_tools(tools, "openai/gpt-5-mini", config) == [
-        {"type": "openrouter:web_search"}
+        {"type": "openrouter:web_search", "parameters": {"engine": "native"}}
     ]
+
+
+def test_web_search_keeps_requested_engine() -> None:
+    api = _make_api("openai/gpt-5-mini")
+    tools, _, config = api.resolve_tools(
+        [_web_search_tool({"engine": "exa"})], "auto", GenerateConfig()
+    )
+    assert openai_responses_tools(tools, "openai/gpt-5-mini", config) == [
+        {"type": "openrouter:web_search", "parameters": {"engine": "exa"}}
+    ]
+
+
+def _search_call(server_tool_use_details: dict[str, Any] | None) -> ModelCall:
+    usage: dict[str, Any] = {"input_tokens": 1, "output_tokens": 1}
+    if server_tool_use_details is not None:
+        usage["server_tool_use_details"] = server_tool_use_details
+    return ModelCall.create(request={}, response={"output": [], "usage": usage})
+
+
+@pytest.mark.parametrize(
+    "options,details,warns",
+    [
+        # OpenRouter ran the search itself although native was requested
+        ({}, {"web_search_requests": 1, "tool_calls_executed": 1}, True),
+        ({"engine": "native"}, {"tool_calls_executed": 1}, True),
+        # the provider's native search
+        ({}, {"web_search_requests": 1}, False),
+        ({}, None, False),
+        # Exa was requested
+        ({"engine": "exa"}, {"tool_calls_executed": 1}, False),
+    ],
+)
+def test_warns_when_native_search_falls_back(
+    options: dict[str, Any],
+    details: dict[str, Any] | None,
+    warns: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import inspect_ai.model._providers.openrouter as openrouter_module
+
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        openrouter_module,
+        "warn_once",
+        lambda logger, message: warnings.append(message),
+    )
+    openrouter_module._warn_if_native_search_fell_back(
+        [_web_search_tool(options)], _search_call(details)
+    )
+    assert bool(warnings) == warns
+    if warns:
+        assert "Exa" in warnings[0]
 
 
 def test_web_search_without_openrouter_provider_is_unchanged() -> None:

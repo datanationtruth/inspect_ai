@@ -188,6 +188,7 @@ def web_search(
           See https://docs.perplexity.ai/docs/agent-api/tools/web-search
 
         - openrouter: Supports the parameters of OpenRouter's web search server tool.
+          `engine` defaults to "native" (the model provider's built-in search).
           See https://openrouter.ai/docs/guides/features/server-tools/web-search
 
         - tavily: Supports options like `max_results`, `search_depth`, etc.

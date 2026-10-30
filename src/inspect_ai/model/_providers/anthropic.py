@@ -75,6 +75,7 @@ from anthropic.types import (
     ToolUseBlockParam,
     UserMessageParam,
     WebSearchResultBlock,
+    WebSearchResultBlockParam,
     WebSearchTool20250305Param,
     WebSearchTool20260209Param,
     WebSearchToolRequestErrorParam,
@@ -5625,9 +5626,11 @@ def message_stop_details(message: Message) -> StopDetails | None:
     )
 
 
+# a concrete list (not the param's `Iterable`, which validates to a lazy
+# single-use iterator and would accept an error object as an iterable of keys)
 web_search_result_block_param_adapter = TypeAdapter[
-    WebSearchToolResultBlockParamContentParam
-](WebSearchToolResultBlockParamContentParam)
+    list[WebSearchResultBlockParam] | WebSearchToolRequestErrorParam
+](list[WebSearchResultBlockParam] | WebSearchToolRequestErrorParam)
 
 
 web_search_result_block_adapter = TypeAdapter[
@@ -5638,6 +5641,69 @@ web_search_result_block_adapter = TypeAdapter[
 beta_text_block_param_adapter = TypeAdapter[Union[str, Iterable[BetaTextBlockParam]]](
     Union[str, Iterable[BetaTextBlockParam]]
 )
+
+
+def _web_fetch_block_params(
+    content: ContentToolUse, result_cleared: bool
+) -> list[MessageBlockParam]:
+    """Rebuild web_fetch use/result block params from a logged ContentToolUse.
+
+    Used when no recorded server tool span is available (e.g. messages restored
+    from a log into a new sample). The logged result is the whole
+    `web_fetch_tool_result` block (Inspect 0.3.180+) or its inner content
+    (earlier versions). A result that is neither is replayed as an
+    `unavailable` fetch error, with a warning.
+
+    Args:
+        content: Logged web_fetch tool use.
+        result_cleared: Whether the result was cleared during compaction.
+
+    Returns:
+        The `server_tool_use` and `web_fetch_tool_result` block params.
+    """
+    arguments = json.loads(content.arguments)
+    fetch_result: dict[str, Any] = {
+        "type": "web_fetch_tool_result",
+        "tool_use_id": content.id,
+        "content": {
+            "type": "web_fetch_tool_result_error",
+            "error_code": "unavailable",
+        },
+    }
+    if result_cleared:
+        # the requested url (the live path uses the fetched one, which differs
+        # only after a redirect)
+        fetch_result["content"] = {"url": str(arguments.get("url", ""))}
+        fetch_result = cast(
+            dict[str, Any],
+            _cleared_result_block_param(
+                cast(BetaWebFetchToolResultBlockParam, fetch_result)
+            ),
+        )
+    else:
+        try:
+            logged = json.loads(content.result)
+        except ValueError:
+            logged = None
+        if isinstance(logged, dict) and logged.get("type") == "web_fetch_tool_result":
+            fetch_result = {**logged, "tool_use_id": content.id}
+        elif isinstance(logged, dict) and logged.get("type") in (
+            "web_fetch_result",
+            "web_fetch_tool_result_error",
+        ):
+            fetch_result["content"] = logged
+        else:
+            warn_once(
+                logger,
+                f"web_fetch result for {content.id} could not be read from the "
+                "log and is replayed as an 'unavailable' fetch error.",
+            )
+    return [
+        BetaServerToolUseBlockParam(
+            type="server_tool_use", id=content.id, name="web_fetch", input=arguments
+        ),
+        cast(BetaWebFetchToolResultBlockParam, fetch_result),
+    ]
 
 
 async def message_block_params(
@@ -5714,12 +5780,12 @@ async def message_block_params(
             return [mcp_use, mcp_result]
 
         # Fall through to reconstruction if not in cache
-        if content.tool_type == "web_search":
-            # we might be parsing an openai web search result so defend ourselves accordingly
-            # note that if this is a native anthropic web_search or web_fetch it will have
-            # been handled by replaying its recorded server tool span. therefore, this is
-            # a web_search from another system which we need to normalize to the
-            # anthropic schema
+        if content.tool_type == "web_search" and content.name == "web_fetch":
+            return _web_fetch_block_params(content, result_cleared)
+        elif content.tool_type == "web_search":
+            # a native anthropic web_search without a recorded server tool span
+            # (e.g. restored from a log), or a web_search from another system
+            # (e.g. openai) which we need to normalize to the anthropic schema
             if result_cleared:
                 result_content: WebSearchToolResultBlockParamContentParam = (
                     WebSearchToolRequestErrorParam(

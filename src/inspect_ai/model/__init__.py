@@ -74,6 +74,7 @@ from ._model import (
     compute_model_cost,
     get_model,
     model_roles,
+    track_model_usage,
 )
 from ._model_call import ModelCall, ModelRequestId
 from ._model_config import ModelConfig
@@ -206,6 +207,7 @@ __all__ = [
     "cache_prune",
     "cache_size",
     "get_model",
+    "track_model_usage",
     "get_model_info",
     "set_model_cost",
     "set_model_info",

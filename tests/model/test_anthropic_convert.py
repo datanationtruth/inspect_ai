@@ -1,5 +1,9 @@
 """Tests for Anthropic model API conversion functions."""
 
+import json
+from typing import Any, cast
+
+import pytest
 from anthropic.types import (
     AssistantMessageParam,
     CitationsConfigParam,
@@ -14,12 +18,21 @@ from anthropic.types import (
     Usage,
     UserMessageParam,
 )
+from pydantic import TypeAdapter
 
-from inspect_ai._util.content import ContentDocument, ContentReasoning, ContentText
-from inspect_ai.model import model_output_from_anthropic
+from inspect_ai._util.content import (
+    ContentDocument,
+    ContentReasoning,
+    ContentText,
+    ContentToolUse,
+)
+from inspect_ai.model import ChatMessage, model_output_from_anthropic
+from inspect_ai.model._assistant_internal import init_sample_assistant_internal
 from inspect_ai.model._chat_message import ChatMessageAssistant
+from inspect_ai.model._compaction.edit import TOOL_RESULT_REMOVED
 from inspect_ai.model._model_output import ModelOutput
 from inspect_ai.model._providers.anthropic import (
+    assistant_message_block_params,
     message_block_params,
     normalize_document_citations,
 )
@@ -390,3 +403,212 @@ async def test_model_output_from_anthropic_mixed_content() -> None:
     assert message_obj.tool_calls is not None
     assert len(message_obj.tool_calls) == 1
     assert message_obj.tool_calls[0].function == "search"
+
+
+# --- server tool rebuild from a log round-trip --------------------------------
+#
+# When assistant messages are restored from a log into a new sample, the
+# recorded server tool spans are gone and the web_search / web_fetch blocks are
+# rebuilt from the logged ContentToolUse items. The rebuild must reproduce the
+# blocks that the in-process recorded state replays.
+
+
+def _server_tool_use(id: str, name: str, input: dict[str, Any]) -> dict[str, Any]:
+    return {"type": "server_tool_use", "id": id, "name": name, "input": input}
+
+
+def _web_search_result(id: str, url: str) -> dict[str, Any]:
+    return {
+        "type": "web_search_tool_result",
+        "tool_use_id": id,
+        "content": [
+            {
+                "type": "web_search_result",
+                "title": "Example",
+                "url": url,
+                "encrypted_content": f"FAKE_ENCRYPTED_{id}",
+                "page_age": "1 day ago",
+            }
+        ],
+    }
+
+
+def _thinking(signature: str) -> dict[str, Any]:
+    return {"type": "thinking", "thinking": "Let me look.", "signature": signature}
+
+
+WEB_SEARCH_BLOCKS = [
+    _server_tool_use("srvtoolu_ws1", "web_search", {"query": "example"}),
+    _web_search_result("srvtoolu_ws1", "https://example.com/a"),
+]
+
+WEB_SEARCH_ERROR_BLOCKS = [
+    _server_tool_use("srvtoolu_ws2", "web_search", {"query": "example"}),
+    {
+        "type": "web_search_tool_result",
+        "tool_use_id": "srvtoolu_ws2",
+        "content": {
+            "type": "web_search_tool_result_error",
+            "error_code": "max_uses_exceeded",
+        },
+    },
+]
+
+WEB_FETCH_BLOCKS = [
+    _server_tool_use("srvtoolu_wf1", "web_fetch", {"url": "https://example.com/b"}),
+    {
+        "type": "web_fetch_tool_result",
+        "tool_use_id": "srvtoolu_wf1",
+        "content": {
+            "type": "web_fetch_result",
+            "url": "https://example.com/b",
+            "retrieved_at": "2026-01-01T00:00:00Z",
+            "content": {
+                "type": "document",
+                "source": {
+                    "type": "text",
+                    "media_type": "text/plain",
+                    "data": "Example page text.",
+                },
+                "title": "Example B",
+            },
+        },
+    },
+]
+
+WEB_FETCH_ERROR_BLOCKS = [
+    _server_tool_use("srvtoolu_wf2", "web_fetch", {"url": "https://example.com/c"}),
+    {
+        "type": "web_fetch_tool_result",
+        "tool_use_id": "srvtoolu_wf2",
+        "content": {
+            "type": "web_fetch_tool_result_error",
+            "error_code": "url_not_accessible",
+        },
+    },
+]
+
+INTERLEAVED_BLOCKS = [
+    _thinking("FAKE_SIG_1"),
+    _server_tool_use("srvtoolu_ws3", "web_search", {"query": "first"}),
+    _web_search_result("srvtoolu_ws3", "https://example.com/1"),
+    _thinking("FAKE_SIG_2"),
+    _server_tool_use("srvtoolu_ws4", "web_search", {"query": "second"}),
+    _web_search_result("srvtoolu_ws4", "https://example.com/2"),
+    *WEB_FETCH_BLOCKS,
+    _thinking("FAKE_SIG_3"),
+    {"type": "text", "text": "Here is what I found."},
+]
+
+
+async def _live_and_log_round_trip_block_params(
+    content: list[dict[str, Any]], clear_results: bool = False
+) -> tuple[list[Any], list[Any]]:
+    """Block params replayed from recorded state and rebuilt after a log round-trip."""
+    init_sample_assistant_internal()
+    output = await model_output_from_anthropic(
+        {
+            "id": "msg_replay",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": content,
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+    )
+    if clear_results:
+        for c in output.message.content:
+            if isinstance(c, ContentToolUse):
+                c.result = TOOL_RESULT_REMOVED
+    live = list(await assistant_message_block_params(output.message))
+
+    # log round-trip into a new sample (no recorded assistant internal state)
+    adapter = TypeAdapter(list[ChatMessage])
+    [restored] = adapter.validate_json(adapter.dump_json([output.message]))
+    assert isinstance(restored, ChatMessageAssistant)
+    init_sample_assistant_internal()
+    rebuilt = list(await assistant_message_block_params(restored))
+    return live, rebuilt
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param([*WEB_SEARCH_BLOCKS, {"type": "text", "text": "ok"}], id="search"),
+        pytest.param(
+            [*WEB_SEARCH_ERROR_BLOCKS, {"type": "text", "text": "ok"}],
+            id="search_error",
+        ),
+        pytest.param([*WEB_FETCH_BLOCKS, {"type": "text", "text": "ok"}], id="fetch"),
+        pytest.param(
+            [*WEB_FETCH_ERROR_BLOCKS, {"type": "text", "text": "ok"}],
+            id="fetch_error",
+        ),
+        pytest.param(INTERLEAVED_BLOCKS, id="interleaved_thinking"),
+    ],
+)
+async def test_server_tool_blocks_rebuilt_from_log_match_recorded(
+    content: list[dict[str, Any]],
+) -> None:
+    live, rebuilt = await _live_and_log_round_trip_block_params(content)
+    # the recorded state replays the wire blocks verbatim (text gains citations)
+    assert [{k: v for k, v in b.items() if k != "citations"} for b in live] == content
+    # the rebuild matches it and serializes (a lazy iterator or a malformed
+    # result fails to serialize or is sent empty)
+    assert json.loads(json.dumps(rebuilt)) == json.loads(json.dumps(live))
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        pytest.param(WEB_SEARCH_BLOCKS, id="search"),
+        pytest.param(WEB_FETCH_BLOCKS, id="fetch"),
+    ],
+)
+async def test_cleared_server_tool_blocks_rebuilt_from_log_match_recorded(
+    content: list[dict[str, Any]],
+) -> None:
+    live, rebuilt = await _live_and_log_round_trip_block_params(
+        content, clear_results=True
+    )
+    assert [b["type"] for b in live] == [b["type"] for b in content]
+    assert rebuilt == live
+
+
+@pytest.mark.parametrize(
+    "blocks", [WEB_FETCH_BLOCKS, WEB_FETCH_ERROR_BLOCKS], ids=["fetch", "fetch_error"]
+)
+async def test_web_fetch_rebuilt_from_pre_0_3_180_log(
+    blocks: list[dict[str, Any]],
+) -> None:
+    """Older logs keep only the fetch result's inner content."""
+    use, result = blocks
+    logged = ContentToolUse(
+        tool_type="web_search",
+        id=use["id"],
+        name="web_fetch",
+        arguments=json.dumps(use["input"]),
+        result=json.dumps(result["content"]),
+    )
+    init_sample_assistant_internal()
+    assert await message_block_params(logged) == [use, result]
+
+
+async def test_unreadable_web_fetch_result_replayed_as_unavailable(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    logged = ContentToolUse(
+        tool_type="web_search",
+        id="srvtoolu_bad",
+        name="web_fetch",
+        arguments=json.dumps({"url": "https://example.com/d"}),
+        result="not json",
+    )
+    init_sample_assistant_internal()
+    _, result = await message_block_params(logged)
+    assert cast(dict[str, Any], result)["content"] == {
+        "type": "web_fetch_tool_result_error",
+        "error_code": "unavailable",
+    }
+    assert "srvtoolu_bad" in caplog.text
